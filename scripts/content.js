@@ -1,4 +1,5 @@
 // Prevent multiple injections
+chrome.runtime.sendMessage({ action: 'contentScriptReady' });
 if (window.pageVoiceInitialized) {
     console.log('Page Voice already initialized');
 } else {
@@ -8,7 +9,8 @@ if (window.pageVoiceInitialized) {
     var speechState = {
         isSpeaking: false,
         isPaused: false,
-        rate: 1.0
+        rate: 1.0,
+        voiceURI: null
     };
 
     var synthesis = window.speechSynthesis;
@@ -19,10 +21,22 @@ if (window.pageVoiceInitialized) {
     var extensionContextValid = true;
     var markedRanges = [];
     var currentCharIndex = 0;
+    var pausedAtIndex = 0;
+    var lastBoundaryIndex = 0;
 
     // Navigation Globals
     var globalFullText = '';
     var globalCurrentOffset = 0;
+
+    // Word segmenter cache
+    var wordSegmenter = null;
+    var cachedSegments = null;
+
+    // Highlight tracking interval
+    var highlightInterval = null;
+    var estimatedPosition = 0;
+    var lastBoundaryTime = 0;
+    var speechStartTime = 0;
 
     // Inject styles
     const style = document.createElement('style');
@@ -75,6 +89,23 @@ if (window.pageVoiceInitialized) {
     }
     forceLoadVoices();
 
+    function getPageLanguage() {
+        return document.documentElement.lang || navigator.language || 'en';
+    }
+
+    function getWordSegmenter() {
+        if (!wordSegmenter) {
+            try {
+                const lang = getPageLanguage();
+                wordSegmenter = new Intl.Segmenter(lang, { granularity: 'word' });
+                console.log(`Created word segmenter for language: ${lang}`);
+            } catch (e) {
+                console.warn('Could not create word segmenter:', e);
+            }
+        }
+        return wordSegmenter;
+    }
+
     function isVisible(element) {
         if (!element) return false;
         const rect = element.getBoundingClientRect();
@@ -89,7 +120,6 @@ if (window.pageVoiceInitialized) {
     }
 
     function getReadableText(element) {
-        // Extract text from an element, prioritizing visible content
         let text = '';
         const nodes = element.childNodes;
 
@@ -100,20 +130,16 @@ if (window.pageVoiceInitialized) {
             } else if (node.nodeType === Node.ELEMENT_NODE) {
                 const tag = node.tagName.toLowerCase();
 
-                // Skip these entirely
                 if (['script', 'style', 'noscript', 'iframe', 'svg', 'button'].includes(tag)) {
                     continue;
                 }
 
-                // Skip hidden elements
                 if (!isVisible(node)) continue;
 
-                // Recursively get text from child elements
                 const childText = getReadableText(node);
                 if (childText) {
                     text += childText + ' ';
 
-                    // Add breaks after block elements
                     if (['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'br'].includes(tag)) {
                         text += '. ';
                     }
@@ -127,9 +153,7 @@ if (window.pageVoiceInitialized) {
     function findBestContentRoot() {
         console.log('=== Finding Best Content Root ===');
 
-        // Try multiple strategies
         const strategies = [
-            // Strategy 1: article tag
             () => {
                 const article = document.querySelector('article');
                 if (article && isVisible(article)) {
@@ -140,7 +164,6 @@ if (window.pageVoiceInitialized) {
                 return null;
             },
 
-            // Strategy 2: main tag
             () => {
                 const main = document.querySelector('main');
                 if (main && isVisible(main)) {
@@ -151,7 +174,6 @@ if (window.pageVoiceInitialized) {
                 return null;
             },
 
-            // Strategy 3: role="main"
             () => {
                 const roleMain = document.querySelector('[role="main"]');
                 if (roleMain && isVisible(roleMain)) {
@@ -162,7 +184,6 @@ if (window.pageVoiceInitialized) {
                 return null;
             },
 
-            // Strategy 4: Largest content container by class
             () => {
                 const contentSelectors = [
                     '.post-content', '.article-content', '.entry-content',
@@ -189,7 +210,6 @@ if (window.pageVoiceInitialized) {
                 return null;
             },
 
-            // Strategy 5: Find element with most paragraph children
             () => {
                 const containers = document.querySelectorAll('div, section, article');
                 let best = null;
@@ -216,7 +236,6 @@ if (window.pageVoiceInitialized) {
             }
         ];
 
-        // Try each strategy
         for (const strategy of strategies) {
             const result = strategy();
             if (result) {
@@ -238,7 +257,6 @@ if (window.pageVoiceInitialized) {
 
         const rootNode = findBestContentRoot();
 
-        // Get all text nodes in the root
         const walker = document.createTreeWalker(
             rootNode,
             NodeFilter.SHOW_TEXT,
@@ -253,17 +271,14 @@ if (window.pageVoiceInitialized) {
 
                     const tag = parent.tagName.toLowerCase();
 
-                    // Reject these tags
                     if (['script', 'style', 'noscript', 'iframe', 'svg'].includes(tag)) {
                         return NodeFilter.FILTER_REJECT;
                     }
 
-                    // Reject if in navigation/header/footer
                     if (parent.closest('nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"]')) {
                         return NodeFilter.FILTER_REJECT;
                     }
 
-                    // Reject buttons and inputs
                     if (parent.closest('button, input, select, textarea, label')) {
                         return NodeFilter.FILTER_REJECT;
                     }
@@ -281,7 +296,6 @@ if (window.pageVoiceInitialized) {
             const parent = node.parentElement;
             const tag = parent.tagName.toLowerCase();
 
-            // Add spacing between different block elements
             if (lastElement && lastElement !== parent) {
                 const lastTag = lastElement.tagName.toLowerCase();
                 if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'li'].includes(lastTag)) {
@@ -317,16 +331,73 @@ if (window.pageVoiceInitialized) {
         return fullText.trim();
     }
 
+    function getWordLength(text, startPos) {
+        const segmenter = getWordSegmenter();
+
+        try {
+            if (segmenter) {
+                const slice = text.substring(startPos, startPos + 50);
+                const segments = segmenter.segment(slice);
+
+                for (const seg of segments) {
+                    if (seg.index === 0 && seg.isWordLike) {
+                        return seg.segment.length;
+                    }
+                }
+
+                for (const seg of segments) {
+                    if (seg.isWordLike) {
+                        return seg.index + seg.segment.length;
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn('Intl.Segmenter failed, using fallback:', e);
+        }
+
+        // Robust fallback using regex patterns
+        const slice = text.substring(startPos, startPos + 50);
+
+        // CJK characters (Chinese, Japanese, Korean)
+        const cjkMatch = slice.match(/^[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF]/);
+        if (cjkMatch) return 1;
+
+        // Arabic script
+        const arabicMatch = slice.match(/^[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]+/);
+        if (arabicMatch) return arabicMatch[0].length;
+
+        // Thai script
+        const thaiMatch = slice.match(/^[\u0E00-\u0E7F]+/);
+        if (thaiMatch) return thaiMatch[0].length;
+
+        // Devanagari (Hindi, Sanskrit, etc.)
+        const devanagariMatch = slice.match(/^[\u0900-\u097F]+/);
+        if (devanagariMatch) return devanagariMatch[0].length;
+
+        // Standard word (Latin, Cyrillic, etc.)
+        const wordMatch = slice.match(/^[\w\u00C0-\u024F\u0400-\u04FF]+/);
+        if (wordMatch) return wordMatch[0].length;
+
+        // Single character fallback
+        return 1;
+    }
+
     function highlightRange(charIndex, charLength) {
         CSS.highlights.delete('speech-word');
         currentCharIndex = charIndex;
+
+        // Get proper word length for any language
+        let actualLength = charLength;
+        if (!actualLength || actualLength < 1) {
+            actualLength = getWordLength(globalFullText, charIndex);
+        }
 
         for (const item of textMap) {
             if (charIndex >= item.start && charIndex < item.end) {
                 try {
                     const range = new Range();
                     const offsetStart = Math.max(0, charIndex - item.start);
-                    const offsetEnd = Math.min(item.node.nodeValue.length, offsetStart + charLength);
+                    const offsetEnd = Math.min(item.node.nodeValue.length, offsetStart + actualLength);
 
                     if (offsetEnd > offsetStart) {
                         range.setStart(item.node, offsetStart);
@@ -336,7 +407,6 @@ if (window.pageVoiceInitialized) {
                         const highlight = new Highlight(range);
                         CSS.highlights.set('speech-word', highlight);
 
-                        // Scroll into view
                         item.element.scrollIntoView({
                             behavior: 'smooth',
                             block: 'center'
@@ -350,15 +420,86 @@ if (window.pageVoiceInitialized) {
         }
     }
 
+    // Fallback highlighting for voices that don't fire boundary events
+    function startHighlightInterval() {
+        stopHighlightInterval();
+
+        const textToSpeak = globalFullText.substring(globalCurrentOffset);
+        const estimatedDuration = (textToSpeak.length / 15) * 1000 / speechState.rate;
+        const updateFrequency = 200;
+
+        speechStartTime = Date.now();
+        lastBoundaryTime = speechStartTime;
+        estimatedPosition = globalCurrentOffset;
+
+        highlightInterval = setInterval(() => {
+            if (!speechState.isSpeaking || speechState.isPaused) {
+                stopHighlightInterval();
+                return;
+            }
+
+            // If we have recent boundary events, use those
+            const timeSinceLastBoundary = Date.now() - lastBoundaryTime;
+            if (timeSinceLastBoundary < 1500) {
+                return;
+            }
+
+            // Estimate position based on time elapsed
+            const elapsed = Date.now() - speechStartTime;
+            const progressRatio = elapsed / estimatedDuration;
+            estimatedPosition = globalCurrentOffset + Math.floor(textToSpeak.length * progressRatio);
+
+            if (estimatedPosition < globalFullText.length) {
+                highlightRange(estimatedPosition, 0);
+            } else {
+                stopHighlightInterval();
+            }
+        }, updateFrequency);
+    }
+
+    function stopHighlightInterval() {
+        if (highlightInterval) {
+            clearInterval(highlightInterval);
+            highlightInterval = null;
+        }
+    }
+
     function markCurrentLocation() {
+        console.log('Marking location at index:', currentCharIndex);
+
+        let positionToMark = currentCharIndex;
+
+        // Safety check: if no range, try to create one from current index
+        if (!window.currentSpeechRange && globalFullText && textMap.length > 0) {
+            console.log('No active range, trying to recreate from index ' + positionToMark);
+            for (const item of textMap) {
+                if (positionToMark >= item.start && positionToMark < item.end) {
+                    try {
+                        const len = getWordLength(globalFullText, positionToMark);
+                        const range = new Range();
+                        const offsetStart = Math.max(0, positionToMark - item.start);
+                        const offsetEnd = Math.min(item.node.nodeValue.length, offsetStart + len);
+                        if (offsetEnd > offsetStart) {
+                            range.setStart(item.node, offsetStart);
+                            range.setEnd(item.node, offsetEnd);
+                            window.currentSpeechRange = range.cloneRange();
+                        }
+                    } catch (e) {
+                        console.warn('Recovery creation failed', e);
+                    }
+                    break;
+                }
+            }
+        }
+
         if (!window.currentSpeechRange) {
             console.warn('No active range to mark');
-            updateDebugOverlay('⚠ No position to mark');
+            updateDebugOverlay('Cannot mark: No text selected');
             setTimeout(() => {
-                if (speechState.isSpeaking) {
-                    updateDebugOverlay(`Speaking...\n${markedRanges.length} marks`);
-                }
-            }, 1500);
+                if (speechState.isSpeaking) updateDebugOverlay('Speaking...');
+                else if (speechState.isPaused) updateDebugOverlay('Paused');
+                else updateDebugOverlay('Ready');
+            }, 1000);
             return;
         }
 
@@ -366,11 +507,10 @@ if (window.pageVoiceInitialized) {
             const clonedRange = window.currentSpeechRange.cloneRange();
             markedRanges.push(clonedRange);
 
-            // Update highlight with all marked ranges
             const highlight = new Highlight(...markedRanges);
             CSS.highlights.set('speech-mark', highlight);
 
-            console.log(`✓ Marked position ${currentCharIndex}, total: ${markedRanges.length}`);
+            console.log(`✓ Marked position ${positionToMark}, total: ${markedRanges.length}`);
             updateDebugOverlay(`✓ Marked!\nTotal marks: ${markedRanges.length}`);
             setTimeout(() => {
                 if (speechState.isSpeaking) {
@@ -392,6 +532,20 @@ if (window.pageVoiceInitialized) {
         CSS.highlights.delete('speech-mark');
         updateDebugOverlay('Marks cleared');
         console.log('All marks cleared');
+    }
+
+    function broadcastState() {
+        if (!extensionContextValid) return;
+        try {
+            chrome.runtime.sendMessage({
+                action: 'stateUpdate',
+                state: speechState
+            });
+        } catch (e) {
+            if (e.message.includes('context invalidated')) {
+                extensionContextValid = false;
+            }
+        }
     }
 
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -440,8 +594,17 @@ if (window.pageVoiceInitialized) {
                 case 'setRate':
                     speechState.rate = request.rate;
                     if (speechState.isSpeaking && !speechState.isPaused) {
-                        // Restart keeping offset
-                        startSpeaking(currentCharIndex);
+                        const savedPosition = Math.max(currentCharIndex, lastBoundaryIndex);
+                        startSpeaking(savedPosition);
+                    }
+                    sendResponse(speechState);
+                    break;
+                case 'setVoice':
+                    speechState.voiceURI = request.voiceURI;
+                    console.log('Voice selected:', speechState.voiceURI);
+                    if (speechState.isSpeaking && !speechState.isPaused) {
+                        const savedPosition = Math.max(currentCharIndex, lastBoundaryIndex);
+                        startSpeaking(savedPosition);
                     }
                     sendResponse(speechState);
                     break;
@@ -454,6 +617,161 @@ if (window.pageVoiceInitialized) {
 
         return true;
     });
+
+    function getSegments() {
+        if (!cachedSegments && globalFullText) {
+            try {
+                const lang = getPageLanguage();
+                console.log(`Using language for segmentation: ${lang}`);
+                const segmenter = new Intl.Segmenter(lang, { granularity: 'sentence' });
+                cachedSegments = [...segmenter.segment(globalFullText)];
+                console.log(`Computed ${cachedSegments.length} sentence segments`);
+            } catch (e) {
+                console.warn('Intl.Segmenter failed, using fallback', e);
+                const sentences = globalFullText.split(/[.!?]+\s+/);
+                let index = 0;
+                cachedSegments = sentences.map(sentence => {
+                    const segment = {
+                        segment: sentence,
+                        index: index,
+                        input: globalFullText
+                    };
+                    index += sentence.length + 2;
+                    return segment;
+                });
+                console.log(`Fallback segmentation: ${cachedSegments.length} segments`);
+            }
+        }
+        return cachedSegments || [];
+    }
+
+    function navigate(direction) {
+        console.log(`=== Navigate ${direction} ===`);
+
+        if (!globalFullText) {
+            globalFullText = buildTextMap();
+            cachedSegments = null;
+        }
+
+        const segments = getSegments();
+        if (segments.length === 0) {
+            console.warn('No segments found');
+            return;
+        }
+
+        let navPosition = currentCharIndex;
+        if (lastBoundaryIndex > 0 && Math.abs(currentCharIndex - lastBoundaryIndex) < 50) {
+            navPosition = lastBoundaryIndex;
+        }
+
+        let currentSegIndex = segments.findIndex(seg =>
+            navPosition >= seg.index && navPosition < seg.index + seg.segment.length
+        );
+
+        if (currentSegIndex === -1) {
+            if (navPosition >= globalFullText.length) {
+                currentSegIndex = segments.length - 1;
+            } else {
+                currentSegIndex = 0;
+            }
+        }
+
+        let newIndex = navPosition;
+
+        if (direction === 'next') {
+            if (currentSegIndex < segments.length - 1) {
+                newIndex = segments[currentSegIndex + 1].index;
+                console.log(`Jumping to next sentence segment: ${newIndex}`);
+            } else {
+                newIndex = globalFullText.length;
+                console.log('At last sentence');
+            }
+        } else if (direction === 'previous') {
+            const currentSeg = segments[currentSegIndex];
+            if (navPosition - currentSeg.index > 10) {
+                newIndex = currentSeg.index;
+                console.log(`Restarting current sentence: ${newIndex}`);
+            } else {
+                if (currentSegIndex > 0) {
+                    newIndex = segments[currentSegIndex - 1].index;
+                    console.log(`Jumping to previous sentence segment: ${newIndex}`);
+                } else {
+                    newIndex = 0;
+                    console.log('At first sentence');
+                }
+            }
+        }
+
+        updateDebugOverlay(`${direction === 'next' ? '→' : '←'} Jumping to ${newIndex}`);
+        startSpeaking(newIndex);
+    }
+
+    function pauseSpeaking() {
+        console.log('Pausing speech...');
+        stopHighlightInterval();
+
+        // Use the most reliable position
+        pausedAtIndex = currentCharIndex;
+        if (lastBoundaryIndex > 0 && Math.abs(currentCharIndex - lastBoundaryIndex) < 50) {
+            pausedAtIndex = lastBoundaryIndex;
+        }
+
+        isInternalStop = true;
+        if (synthesis.speaking || synthesis.pending) {
+            synthesis.cancel();
+        }
+        cleanupCurrentUtterance();
+        isInternalStop = false;
+
+        speechState.isSpeaking = false;
+        speechState.isPaused = true;
+
+        updateDebugOverlay(`⏸ Paused at ${pausedAtIndex}\n${markedRanges.length} marks`);
+        broadcastState();
+        console.log(`✓ Paused at position: ${pausedAtIndex}`);
+    }
+
+    function resumeSpeaking() {
+        console.log(`Resuming speech from position: ${pausedAtIndex}`);
+
+        if (!speechState.isPaused) {
+            console.log('Not in paused state');
+            return;
+        }
+
+        speechState.isPaused = false;
+
+        if (pausedAtIndex < 0) pausedAtIndex = 0;
+        if (pausedAtIndex > globalFullText.length) pausedAtIndex = globalFullText.length - 1;
+
+        startSpeaking(pausedAtIndex);
+        console.log('✓ Resumed');
+    }
+
+    function stopSpeaking() {
+        console.log('Stopping speech');
+        stopHighlightInterval();
+
+        isInternalStop = true;
+        if (synthesis.speaking || synthesis.pending) {
+            synthesis.cancel();
+        }
+        cleanupCurrentUtterance();
+        isInternalStop = false;
+
+        speechState.isSpeaking = false;
+        speechState.isPaused = false;
+        globalCurrentOffset = 0;
+        currentCharIndex = 0;
+        pausedAtIndex = 0;
+        lastBoundaryIndex = 0;
+
+        clearHighlight();
+        activeUtterances.clear();
+
+        updateDebugOverlay(`⏹ Stopped\n${markedRanges.length} marks`);
+        broadcastState();
+    }
 
     function cleanupCurrentUtterance() {
         if (currentUtterance) {
@@ -481,11 +799,15 @@ if (window.pageVoiceInitialized) {
             synthesis.cancel();
         }
         cleanupCurrentUtterance();
+        stopHighlightInterval();
         isInternalStop = false;
 
         // Rebuild map only if starting fresh or map missing
         if (startOffset === 0 || !globalFullText) {
             globalFullText = buildTextMap();
+            wordSegmenter = null;
+            getWordSegmenter();
+            cachedSegments = null;
         }
 
         if (!globalFullText || globalFullText.length < 10) {
@@ -497,7 +819,6 @@ if (window.pageVoiceInitialized) {
             return;
         }
 
-        // Validation
         if (startOffset < 0) startOffset = 0;
         if (startOffset >= globalFullText.length) {
             updateDebugOverlay('End of content');
@@ -509,6 +830,8 @@ if (window.pageVoiceInitialized) {
 
         globalCurrentOffset = startOffset;
         currentCharIndex = startOffset;
+        lastBoundaryIndex = startOffset;
+        pausedAtIndex = startOffset;
 
         const textToSpeak = globalFullText.substring(startOffset);
         updateDebugOverlay(`Starting... (${Math.round((startOffset / globalFullText.length) * 100)}%)`);
@@ -518,10 +841,34 @@ if (window.pageVoiceInitialized) {
         utterance.volume = 1.0;
         utterance.pitch = 1.0;
 
-        const enVoice = voices.find(v => v.lang.startsWith('en')) || voices[0];
-        if (enVoice) {
-            utterance.voice = enVoice;
-            console.log(`Using voice: ${enVoice.name} (${enVoice.lang})`);
+        let selectedVoice = null;
+
+        if (speechState.voiceURI) {
+            selectedVoice = voices.find(v => v.voiceURI === speechState.voiceURI);
+        }
+
+        if (!selectedVoice) {
+            const pageLang = getPageLanguage();
+            const langCode = pageLang.split('-')[0].toLowerCase();
+
+            selectedVoice = voices.find(v => v.lang.toLowerCase().startsWith(pageLang.toLowerCase()));
+
+            if (!selectedVoice) {
+                selectedVoice = voices.find(v => v.lang.toLowerCase().startsWith(langCode));
+            }
+
+            if (!selectedVoice) {
+                selectedVoice = voices.find(v => v.lang.startsWith('en'));
+            }
+
+            if (!selectedVoice && voices.length > 0) {
+                selectedVoice = voices[0];
+            }
+        }
+
+        if (selectedVoice) {
+            utterance.voice = selectedVoice;
+            console.log(`Using voice: ${selectedVoice.name} (${selectedVoice.lang}) for page language: ${getPageLanguage()}`);
         }
 
         currentUtterance = utterance;
@@ -534,6 +881,9 @@ if (window.pageVoiceInitialized) {
                 updateDebugOverlay(`Speaking...\n${textToSpeak.length} chars\n${markedRanges.length} marks`);
                 broadcastState();
                 console.log('✓ Speech started');
+
+                // Start fallback highlighting for voices with poor boundary support
+                startHighlightInterval();
             }
         };
 
@@ -542,6 +892,7 @@ if (window.pageVoiceInitialized) {
                 console.log('✓ Speech ended');
                 speechState.isSpeaking = false;
                 speechState.isPaused = false;
+                stopHighlightInterval();
                 clearHighlight();
                 cleanupCurrentUtterance();
                 updateDebugOverlay(`Finished\n${markedRanges.length} marks`);
@@ -558,6 +909,7 @@ if (window.pageVoiceInitialized) {
                 console.error('Speech error:', e.error);
                 speechState.isSpeaking = false;
                 speechState.isPaused = false;
+                stopHighlightInterval();
                 clearHighlight();
                 cleanupCurrentUtterance();
                 updateDebugOverlay(`Error: ${e.error}\n${markedRanges.length} marks`);
@@ -566,17 +918,31 @@ if (window.pageVoiceInitialized) {
         };
 
         utterance.onboundary = (event) => {
-            if (currentUtterance === utterance && event.name === 'word') {
-                // event.charIndex is relative to the SUBSTRING
-                const absoluteIndex = globalCurrentOffset + event.charIndex;
-                currentCharIndex = absoluteIndex;
-                highlightRange(absoluteIndex, event.charLength || 5);
+            if (currentUtterance !== utterance) return;
+
+            // Update time tracking for boundary events
+            lastBoundaryTime = Date.now();
+
+            // Calculate absolute position in full text
+            const absoluteIndex = globalCurrentOffset + event.charIndex;
+
+            // Update all position tracking variables
+            currentCharIndex = absoluteIndex;
+            lastBoundaryIndex = absoluteIndex;
+            pausedAtIndex = absoluteIndex;
+
+            // Highlight on boundary events
+            if (event.name === 'word') {
+                highlightRange(absoluteIndex, event.charLength || 0);
+            } else if (event.name === 'sentence') {
+                highlightRange(absoluteIndex, 0);
+            } else {
+                highlightRange(absoluteIndex, 0);
             }
         };
 
         try {
             synthesis.speak(utterance);
-            // Chrome quirk workaround
             setTimeout(() => {
                 if (currentUtterance === utterance && synthesis.pending && !synthesis.speaking) {
                     console.log('Chrome quirk: restarting speech');
@@ -589,130 +955,10 @@ if (window.pageVoiceInitialized) {
             updateDebugOverlay(`Error: ${err.message}`);
             speechState.isSpeaking = false;
             speechState.isPaused = false;
+            stopHighlightInterval();
             cleanupCurrentUtterance();
             broadcastState();
         }
-    }
-
-    function navigate(direction) {
-        if (!globalFullText) {
-            console.warn('No text loaded for navigation');
-            return;
-        }
-
-        let newIndex = currentCharIndex;
-
-        if (direction === 'next') {
-            // Look ahead to find next sentence
-            const lookAhead = 20;
-            const searchStart = newIndex + lookAhead;
-
-            if (searchStart >= globalFullText.length) {
-                console.log('Already at end of content');
-                updateDebugOverlay('End of content');
-                return;
-            }
-
-            const remainingText = globalFullText.substring(searchStart);
-            const match = remainingText.match(/[.!?]\s+/);
-
-            if (match) {
-                newIndex = searchStart + match.index + match[0].length;
-            } else {
-                // No punctuation found, jump by fixed amount
-                newIndex = Math.min(searchStart + 100, globalFullText.length - 1);
-            }
-
-            console.log(`Navigate next: ${currentCharIndex} -> ${newIndex}`);
-        }
-        else if (direction === 'previous') {
-            // Look back to find previous sentence
-            const lookBack = 20;
-            const searchEnd = Math.max(0, newIndex - lookBack);
-
-            if (searchEnd === 0) {
-                newIndex = 0;
-                console.log('Navigate to start');
-            } else {
-                const previousText = globalFullText.substring(0, searchEnd);
-                const matches = [...previousText.matchAll(/[.!?]\s+/g)];
-
-                if (matches.length > 0) {
-                    const lastMatch = matches[matches.length - 1];
-                    newIndex = lastMatch.index + lastMatch[0].length;
-                } else {
-                    // No punctuation found, jump back by fixed amount
-                    newIndex = Math.max(0, searchEnd - 100);
-                }
-            }
-
-            console.log(`Navigate previous: ${currentCharIndex} -> ${newIndex}`);
-        }
-
-        // Clamp to valid range
-        newIndex = Math.max(0, Math.min(newIndex, globalFullText.length - 1));
-
-        // Restart speech from new position
-        startSpeaking(newIndex);
-    }
-
-    function pauseSpeaking() {
-        console.log('Attempting to pause');
-        if (synthesis.speaking && !synthesis.paused) {
-            synthesis.pause();
-            speechState.isPaused = true;
-            speechState.isSpeaking = true; // Still considered "speaking", just paused
-            updateDebugOverlay(`Paused\n${markedRanges.length} marks`);
-            broadcastState();
-            console.log('✓ Paused');
-        } else {
-            console.log('Cannot pause - not speaking or already paused');
-        }
-    }
-
-    function resumeSpeaking() {
-        console.log('Attempting to resume');
-        if (synthesis.paused) {
-            synthesis.resume();
-            speechState.isPaused = false;
-            speechState.isSpeaking = true;
-            updateDebugOverlay(`Speaking...\n${markedRanges.length} marks`);
-            broadcastState();
-            console.log('✓ Resumed');
-        } else {
-            console.log('Cannot resume - not paused');
-        }
-    }
-
-    function stopSpeaking() {
-        console.log('Stopping speech');
-        isInternalStop = true;
-
-        if (synthesis.speaking || synthesis.pending) {
-            synthesis.cancel();
-        }
-
-        speechState.isSpeaking = false;
-        speechState.isPaused = false;
-        cleanupCurrentUtterance();
-        activeUtterances.clear();
-        clearHighlight();
-        updateDebugOverlay(`Stopped\n${markedRanges.length} marks`);
-        broadcastState();
-
-        setTimeout(() => {
-            isInternalStop = false;
-        }, 100);
-
-        console.log('✓ Stopped');
-    }
-
-    function broadcastState() {
-        if (!extensionContextValid || !chrome.runtime?.id) return;
-        chrome.runtime.sendMessage({
-            action: 'stateUpdate',
-            state: speechState
-        }).catch(() => { });
     }
 
     window.addEventListener('beforeunload', () => stopSpeaking());
