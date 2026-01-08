@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Page Voice - TTS Reader",
+  "name": "HearIt",
   "version": "1.0",
-  "description": "Reads the content of the current page with text highlighting.",
+  "description": "HearIt is a Chrome extension that turns web page content into clear, natural-sounding voice, making it easier to consume long articles, blogs, and documents by listening instead of reading.",
   "permissions": [
     "activeTab",
     "scripting"
@@ -12,8 +12,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["scripts/content.js"]
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "scripts/content.js"
+      ]
     }
   ]
 }
