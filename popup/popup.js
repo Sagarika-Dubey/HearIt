@@ -3,6 +3,7 @@ const pauseBtn = document.getElementById('pauseBtn');
 const resumeBtn = document.getElementById('resumeBtn');
 const stopBtn = document.getElementById('stopBtn');
 const markBtn = document.getElementById('markBtn');
+const openViewerBtn = document.getElementById('openViewerBtn');
 
 // Navigation Buttons
 const prevBtn = document.getElementById('prevBtn');
@@ -60,8 +61,30 @@ function debug(msg) {
 chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (tabs[0]) {
         currentTabId = tabs[0].id;
-        // Ask for current state
-        sendMessage('getState');
+        const url = tabs[0].url || '';
+
+        // PDF Detection
+        if (url.toLowerCase().endsWith('.pdf') || url.startsWith('file:') && url.endsWith('.pdf')) {
+            // It is likely a PDF
+            if (openViewerBtn) {
+                openViewerBtn.style.display = 'flex';
+                openViewerBtn.onclick = () => {
+                    const viewerUrl = chrome.runtime.getURL('viewer/viewer.html') + '?file=' + encodeURIComponent(url);
+                    chrome.tabs.create({ url: viewerUrl });
+                };
+            }
+            // Hide standard controls since they won't work on the raw PDF
+            document.querySelector('.controls-grid').style.display = 'none'; // Assuming layout allows this
+            statusDiv.textContent = 'PDF detected. Open in Reader to listen.';
+
+            // Disable others
+            playBtn.style.display = 'none';
+        } else {
+            // Normal page
+            if (openViewerBtn) openViewerBtn.style.display = 'none';
+            // Ask for current state
+            sendMessage('getState');
+        }
     } else {
         debug('Error: No active tab');
     }
@@ -98,7 +121,7 @@ function sendMessage(action, data = {}) {
         // ERROR HANDLING: If message fails (content script not ready/loaded)
         if (chrome.runtime.lastError) {
             const err = chrome.runtime.lastError.message;
-            console.warn('Msg failed:', err);
+            //console.warn('Msg failed:', err);
 
             // Only try injecting if it looks like the script is missing
             if (err.includes('Receiving end does not exist') || err.includes('Could not establish connection')) {
@@ -135,7 +158,7 @@ function sendMessage(action, data = {}) {
                 }, () => {
                     if (chrome.runtime.lastError) {
                         chrome.runtime.onMessage.removeListener(readyListener);
-                        console.error('Injection failed:', chrome.runtime.lastError.message);
+                        //console.error('Injection failed:', chrome.runtime.lastError.message);
                         debug('Err: Injection failed');
                     } else {
                         // If we don't hear back quickly, try anyway

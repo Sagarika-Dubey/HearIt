@@ -154,6 +154,16 @@ if (window.pageVoiceInitialized) {
         console.log('=== Finding Best Content Root ===');
 
         const strategies = [
+            // PDF Viewer Strategy
+            () => {
+                const viewer = document.getElementById('viewer');
+                if (viewer && isVisible(viewer)) {
+                    console.log('PDF Viewer found');
+                    return { element: viewer, strategy: 'pdf-viewer', chars: 1000 }; // High confidence
+                }
+                return null;
+            },
+
             () => {
                 const article = document.querySelector('article');
                 if (article && isVisible(article)) {
@@ -276,7 +286,10 @@ if (window.pageVoiceInitialized) {
                     }
 
                     if (parent.closest('nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"]')) {
-                        return NodeFilter.FILTER_REJECT;
+                        // Exception for PDF viewer which might be inside something else (unlikely but safe)
+                        if (!parent.closest('#viewer')) {
+                            return NodeFilter.FILTER_REJECT;
+                        }
                     }
 
                     if (parent.closest('button, input, select, textarea, label')) {
