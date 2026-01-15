@@ -35,7 +35,8 @@ async function loadPDF() {
 
     } catch (error) {
         console.error('Error loading PDF:', error);
-        showError('Error loading PDF: ' + error.message);
+        showError('Error loading PDF: ' + (error.message || error));
+
     }
 }
 
@@ -64,6 +65,8 @@ async function renderPage(pageNum) {
     textLayerDiv.className = 'textLayer';
     textLayerDiv.style.width = Math.floor(viewport.width) + 'px';
     textLayerDiv.style.height = Math.floor(viewport.height) + 'px';
+    // Fix: Set --scale-factor CSS variable as required by newer PDF.js versions
+    textLayerDiv.style.setProperty('--scale-factor', scale);
 
     pageDiv.appendChild(canvas);
     pageDiv.appendChild(textLayerDiv);
@@ -80,12 +83,18 @@ async function renderPage(pageNum) {
 
         // Render text layer
         const textContent = await page.getTextContent();
-        pdfjsLib.renderTextLayer({
+        // Fix: pdfjsLib.renderTextLayer returns a simpler object in newer versions, 
+        // need to await its promise property if it exists, or just call it.
+        // Actually, in recent versions verify the API. 
+        // It seems typically: await pdfjsLib.renderTextLayer({...}).promise;
+        const textLayerRenderTask = pdfjsLib.renderTextLayer({
             textContent: textContent,
             container: textLayerDiv,
             viewport: viewport,
             textDivs: []
         });
+
+        await textLayerRenderTask.promise;
 
     } catch (e) {
         console.warn('Page render error:', e);

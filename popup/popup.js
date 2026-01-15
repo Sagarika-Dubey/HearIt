@@ -63,8 +63,9 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         currentTabId = tabs[0].id;
         const url = tabs[0].url || '';
 
-        // PDF Detection
-        if (url.toLowerCase().endsWith('.pdf') || url.startsWith('file:') && url.endsWith('.pdf')) {
+        // PDF Detection (exclude the viewer itself)
+        const isViewer = url.includes('/viewer/viewer.html');
+        if (!isViewer && (url.toLowerCase().endsWith('.pdf') || (url.startsWith('file:') && url.endsWith('.pdf')))) {
             // It is likely a PDF
             if (openViewerBtn) {
                 openViewerBtn.style.display = 'flex';
@@ -74,7 +75,11 @@ chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
                 };
             }
             // Hide standard controls since they won't work on the raw PDF
-            document.querySelector('.controls-grid').style.display = 'none'; // Assuming layout allows this
+            // Hide standard controls since they won't work on the raw PDF
+            const playerCard = document.querySelector('.player-card');
+            if (playerCard) playerCard.style.display = 'none';
+            const settings = document.querySelector('.settings');
+            if (settings) settings.style.display = 'none';
             statusDiv.textContent = 'PDF detected. Open in Reader to listen.';
 
             // Disable others

@@ -550,11 +550,30 @@ if (window.pageVoiceInitialized) {
     function broadcastState() {
         if (!extensionContextValid) return;
         try {
+            // Check if runtime is still available
+            if (!chrome.runtime || !chrome.runtime.id) {
+                console.warn('Extension context invalidated, stopping broadcast');
+                extensionContextValid = false;
+                return;
+            }
+
             chrome.runtime.sendMessage({
                 action: 'stateUpdate',
                 state: speechState
+            }).catch(e => {
+                // Ignore "Receiving end does not exist" errors which happen when popup is closed
+                if (e.message.includes('Receiving end does not exist') ||
+                    e.message.includes('Could not establish connection')) {
+                    // This is expected when popup is closed, don't invalidate context
+                    return;
+                }
+                console.warn('Broadcast failed:', e);
+                if (e.message.includes('context invalidated')) {
+                    extensionContextValid = false;
+                }
             });
         } catch (e) {
+            console.warn('Broadcast error:', e);
             if (e.message.includes('context invalidated')) {
                 extensionContextValid = false;
             }
